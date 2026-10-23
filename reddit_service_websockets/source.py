@@ -2,12 +2,15 @@ import json
 import logging
 import socket
 
+import amqp
 import gevent
-import pika
-import pika.exceptions
 
 
 LOG = logging.getLogger(__name__)
+
+# how long one wait for incoming frames lasts before the loop checks the
+# connection again (the wait itself yields to other greenlets)
+DRAIN_TIMEOUT = 1
 
 
 class MessageSource(object):
@@ -16,6 +19,10 @@ class MessageSource(object):
     This will monitor a fanout exchange on AMQP and signal on receipt of any
     messages, as well as allow messages to be sent to a topic exchange on
     status changes within the system.
+
+    It uses py-amqp, whose sockets gevent's monkey-patching makes
+    cooperative: pika's BlockingConnection runs its own poll loop, which
+    never finished connecting under gevent, so no messages arrived.
 
     """
 
@@ -32,77 +39,67 @@ class MessageSource(object):
         self.send_status_messages = config.send_status_messages
         self.message_handler = None
 
+        self.connection = None
         self.channel = None
         self.publish_channel = None
 
     def _connect(self):
-        credentials = pika.PlainCredentials(self.username, self.password)
-        params = pika.ConnectionParameters(
-            host=self.host,
-            port=self.port,
+        self.connection = amqp.Connection(
+            host="%s:%d" % (self.host, self.port),
+            userid=self.username,
+            password=self.password,
             virtual_host=self.vhost,
-            credentials=credentials,
         )
-
-        # Use a blocking connection and drive it from gevent in pump_messages
-        self.connection = pika.BlockingConnection(params)
+        self.connection.connect()
 
         # Publisher channel (use a dedicated channel for publishing)
         self.publish_channel = self.connection.channel()
 
-        # Consumer channel
+        # Consumer channel: a queue of our own on the fanout exchange (as
+        # r2 declares it: not durable, not auto-deleted)
         self.channel = self.connection.channel()
-        self.channel.exchange_declare(exchange=self.broadcast_exchange, exchange_type="fanout")
-        q = self.channel.queue_declare(queue="", exclusive=True, auto_delete=True)
-        queue_name = q.method.queue
-        self.channel.queue_bind(queue=queue_name, exchange=self.broadcast_exchange)
-
-        # Register a consumer that calls into the existing message handler
-        # NOTE: We rely on pump_messages to call process_data_events periodically.
-        self.channel.basic_qos(prefetch_count=1)
-        self.channel.basic_consume(queue=queue_name, on_message_callback=self._on_pika_message, auto_ack=False)
+        self.channel.exchange_declare(
+            exchange=self.broadcast_exchange, type="fanout",
+            durable=False, auto_delete=False)
+        queue_name, _, _ = self.channel.queue_declare(
+            queue="", exclusive=True, auto_delete=True)
+        self.channel.queue_bind(queue=queue_name,
+                                exchange=self.broadcast_exchange)
+        self.channel.basic_consume(queue=queue_name,
+                                   callback=self._on_message, no_ack=True)
 
     @property
     def connected(self):
         return bool(self.connection)
 
-    def _on_queue_created(self, queue_name, *ignored):
-        # This method is a haigha-style callback and is no longer used with pika.
-        pass
-
-    def _on_pika_message(self, ch, method, properties, body):
-        try:
-            if self.message_handler:
-                decoded = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body
-                namespace = method.routing_key
-                self.message_handler(namespace=namespace, message=decoded)
-        finally:
-            try:
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-            except Exception:
-                LOG.exception("failed to ack message")
-
     def _on_message(self, message):
         if self.message_handler:
-            decoded = message.body.decode("utf-8")
+            body = message.body
+            decoded = (body.decode("utf-8")
+                       if isinstance(body, (bytes, bytearray)) else body)
             namespace = message.delivery_info["routing_key"]
             self.message_handler(namespace=namespace, message=decoded)
 
     def _on_close(self):
         LOG.warning("lost connection")
+        try:
+            if self.connection:
+                self.connection.collect()
+        except Exception:
+            pass
         self.connection = None
         self.channel = None
-        self.publisher = None
+        self.publish_channel = None
 
     def send_message(self, key, payload):
         """Publish a status update to the status exchange."""
-        if self.send_status_messages and self.publisher:
+        if self.send_status_messages and self.publish_channel:
             serialized_payload = json.dumps(payload).encode("utf-8")
             try:
                 self.publish_channel.basic_publish(
+                    amqp.Message(serialized_payload),
                     exchange=self.status_exchange,
                     routing_key=key,
-                    body=serialized_payload,
                 )
             except Exception:
                 LOG.exception("failed to publish message")
@@ -119,14 +116,12 @@ class MessageSource(object):
                 LOG.info("connected")
 
                 while self.connected:
-                    LOG.debug("pumping")
                     try:
-                        # Process network events for the blocking connection
-                        self.connection.process_data_events(time_limit=1)
-                    except pika.exceptions.AMQPError as exc:
-                        LOG.warning("connection processing failed: %s", exc)
-                        break
+                        self.connection.drain_events(timeout=DRAIN_TIMEOUT)
+                    except socket.timeout:
+                        pass
                     gevent.sleep()
-            except (socket.error, pika.exceptions.AMQPConnectionError) as exception:
-                LOG.warning("connection failed: %s", exception)
-                gevent.sleep(1)
+            except (socket.error, OSError, amqp.exceptions.AMQPError) as exc:
+                LOG.warning("connection failed: %s", exc)
+            self._on_close()
+            gevent.sleep(1)

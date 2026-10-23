@@ -9,7 +9,7 @@ setup(
     install_requires=[
         "gevent",
         "gevent-websocket",
-        "pika>=1.3.2,<2",
+        "amqp>=5,<6",
         "baseplate",
         "manhole",
     ],

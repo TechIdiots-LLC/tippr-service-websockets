@@ -211,6 +211,10 @@ class SocketServer(object):
             self.connections.remove(websocket)
             dispatcher.kill()
 
+        # geventwebsocket's handler iterates the result once the socket
+        # closes; None made every disconnect log a TypeError
+        return []
+
     def _authorized_to_quiesce(self, environ):
         auth_header = environ.get('HTTP_AUTHORIZATION', None)
         if not auth_header:
